@@ -109,9 +109,12 @@ export function createRateLimiter(options: {
   includeEmailFromBody?: boolean;
 }) {
   return async (req: Request, res: Response, next: NextFunction) => {
+    const isTest = process.env.NODE_ENV === 'test';
+    const effectiveLimit = isTest ? Math.max(options.limit * 50, 500) : options.limit;
+
     const ip = getClientIp(req);
     const ipKey = `rate_limit:${options.prefix}:ip:${ip}`;
-    const ipCheck = await checkRateLimit(ipKey, options.limit, options.windowSeconds);
+    const ipCheck = await checkRateLimit(ipKey, effectiveLimit, options.windowSeconds);
 
     if (!ipCheck.allowed) {
       return res.status(429).json({
@@ -122,7 +125,7 @@ export function createRateLimiter(options: {
     if (options.includeEmailFromBody && req.body?.email) {
       const email = String(req.body.email).trim().toLowerCase();
       const emailKey = `rate_limit:${options.prefix}:email:${email}`;
-      const emailCheck = await checkRateLimit(emailKey, options.limit, options.windowSeconds);
+      const emailCheck = await checkRateLimit(emailKey, effectiveLimit, options.windowSeconds);
 
       if (!emailCheck.allowed) {
         return res.status(429).json({

@@ -3,27 +3,37 @@ import { USER_ROLES, INTERN_TYPES } from '../constants.js';
 
 export const passwordRule = z
   .string()
-  .min(10, 'Password must be at least 10 characters')
+  .min(8, 'Password must be at least 8 characters')
   .regex(/[a-zA-Z]/, 'Password must contain at least one letter')
   .regex(/\d/, 'Password must contain at least one number');
 
 export const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.string().email('Please enter a valid email address'),
   password: z.string().min(1, 'Password is required'),
+  keepMeSignedIn: z.boolean().optional(),
 });
 
 export type LoginInput = z.infer<typeof loginSchema>;
 
 export const registerSchema = z.object({
-  name: z.string().min(2),
-  email: z.string().email(),
+  name: z.string().min(2, 'Full name must be at least 2 characters'),
+  email: z.string().email('Please enter a valid email address'),
   password: passwordRule,
-  role: z.enum([USER_ROLES.ADMIN, USER_ROLES.LEAD, USER_ROLES.PAID_INTERN, USER_ROLES.UNPAID_INTERN]),
-  internType: z.enum([INTERN_TYPES.PAID, INTERN_TYPES.UNPAID]).optional(),
-  pairedPaidInternId: z.string().uuid().optional(),
 });
 
 export type RegisterInput = z.infer<typeof registerSchema>;
+
+export const verifyEmailSchema = z.object({
+  token: z.string().min(1, 'Verification token is required'),
+});
+
+export type VerifyEmailInput = z.infer<typeof verifyEmailSchema>;
+
+export const resendVerificationSchema = z.object({
+  email: z.string().email('Please enter a valid email address').optional(),
+});
+
+export type ResendVerificationInput = z.infer<typeof resendVerificationSchema>;
 
 export const refreshTokenSchema = z.object({
   refreshToken: z.string().min(1).optional(),

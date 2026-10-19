@@ -4,6 +4,8 @@ import dotenv from 'dotenv';
 import path from 'path';
 import crypto from 'crypto';
 
+dotenv.config({ path: path.resolve(process.cwd(), '.env') });
+dotenv.config({ path: path.resolve(process.cwd(), '../.env') });
 dotenv.config({ path: path.resolve(process.cwd(), '../../.env') });
 dotenv.config();
 

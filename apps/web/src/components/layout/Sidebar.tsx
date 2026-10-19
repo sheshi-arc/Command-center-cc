@@ -27,6 +27,7 @@ export interface CurrentUser {
   internType?: 'paid' | 'unpaid' | null;
   currentLevel?: number;
   avatarUrl?: string | null;
+  emailVerified?: boolean;
 }
 
 interface SidebarProps {

@@ -17,6 +17,8 @@ const AutomationsScreen = lazy(() => import('./screens/Automations/AutomationsSc
 const ProfileScreen = lazy(() => import('./screens/Profile/ProfileScreen.js'));
 const PublicVerifyScreen = lazy(() => import('./screens/PublicVerify/PublicVerifyScreen.js').then(m => ({ default: m.PublicVerifyScreen })));
 const LoginScreen = lazy(() => import('./screens/Login/LoginScreen.js'));
+const SignUpScreen = lazy(() => import('./screens/SignUp/SignUpScreen.js'));
+const VerifyEmailScreen = lazy(() => import('./screens/VerifyEmail/VerifyEmailScreen.js'));
 const AcceptInviteScreen = lazy(() => import('./screens/AcceptInvite/AcceptInviteScreen.js'));
 const ResetPasswordScreen = lazy(() => import('./screens/ResetPassword/ResetPasswordScreen.js'));
 
@@ -57,6 +59,15 @@ export const App: React.FC = () => {
             path="/login"
             element={currentUser ? <Navigate to="/" replace /> : <LoginScreen />}
           />
+          <Route
+            path="/signup"
+            element={currentUser ? <Navigate to="/" replace /> : <SignUpScreen />}
+          />
+          <Route
+            path="/register"
+            element={currentUser ? <Navigate to="/" replace /> : <SignUpScreen />}
+          />
+          <Route path="/verify-email" element={<VerifyEmailScreen />} />
           <Route
             path="/accept-invite"
             element={currentUser ? <Navigate to="/" replace /> : <AcceptInviteScreen />}

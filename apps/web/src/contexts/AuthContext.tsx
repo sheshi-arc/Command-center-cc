@@ -14,6 +14,7 @@ export interface User {
   marksheetPercentage?: number | null;
   marksheetConfirmed?: boolean;
   avatarUrl?: string | null;
+  emailVerified?: boolean;
   mustChangePassword?: boolean;
   emailNotificationsMuted?: boolean;
   pushNotificationsMuted?: boolean;
@@ -24,7 +25,9 @@ export interface User {
 interface AuthContextValue {
   currentUser: User | null;
   isLoading: boolean;
-  login: (email: string, pass: string) => Promise<void>;
+  login: (email: string, pass: string, keepMeSignedIn?: boolean) => Promise<void>;
+  register: (name: string, email: string, pass: string) => Promise<void>;
+  resendVerification: (email?: string) => Promise<void>;
   acceptInvite: (token: string, password?: string, useMicrosoft?: boolean, microsoftId?: string) => Promise<void>;
   logout: () => Promise<void>;
   changePassword: (newPassword: string, currentPassword?: string) => Promise<void>;
@@ -32,7 +35,7 @@ interface AuthContextValue {
   updateCurrentUser: (updates: Partial<User>) => void;
 }
 
-const AuthContext = createContext<AuthContextValue | null>(null);
+export const AuthContext = createContext<AuthContextValue | null>(null);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -62,15 +65,33 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     loadUser();
   }, [loadUser]);
 
-  const login = async (email: string, pass: string) => {
+  const login = async (email: string, pass: string, keepMeSignedIn?: boolean) => {
     const res = await apiRequest<{ accessToken: string; user: User }>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password: pass }),
+      body: JSON.stringify({ email, password: pass, keepMeSignedIn }),
     });
 
     localStorage.setItem('token', res.accessToken);
     localStorage.setItem('user', JSON.stringify(res.user));
     setCurrentUser(res.user);
+  };
+
+  const register = async (name: string, email: string, pass: string) => {
+    const res = await apiRequest<{ accessToken: string; user: User }>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ name, email, password: pass }),
+    });
+
+    localStorage.setItem('token', res.accessToken);
+    localStorage.setItem('user', JSON.stringify(res.user));
+    setCurrentUser(res.user);
+  };
+
+  const resendVerification = async (email?: string) => {
+    await apiRequest('/auth/resend-verification', {
+      method: 'POST',
+      body: JSON.stringify({ email: email || currentUser?.email }),
+    });
   };
 
   const acceptInvite = async (token: string, password?: string, useMicrosoft?: boolean, microsoftId?: string) => {
@@ -123,6 +144,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         currentUser,
         isLoading,
         login,
+        register,
+        resendVerification,
         acceptInvite,
         logout,
         changePassword,

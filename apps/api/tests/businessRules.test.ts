@@ -235,17 +235,18 @@ describe('Command Center for Software Hub 2.0 - Core Business Rules, 5-Admin Lim
     let inviteToken: string;
     const inviteEmail = `new_intern_${Date.now()}@smru.edu.in`;
 
-    it('rejects public self-registration with HTTP 403', async () => {
+    it('allows open self-registration with any email and assigns unpaid_intern role', async () => {
       const res = await request(app)
         .post('/api/auth/register')
         .send({
-          email: 'random@smru.edu.in',
+          email: 'random_applicant@gmail.com',
           password: 'Password123!',
           name: 'Random User',
         });
 
-      expect(res.status).toBe(403);
-      expect(res.body.message).toContain('Public registration is disabled');
+      expect(res.status).toBe(201);
+      expect(res.body.user.role).toBe('unpaid_intern');
+      expect(res.body.accessToken).toBeDefined();
     });
 
     it('allows Admin to create an invite link', async () => {

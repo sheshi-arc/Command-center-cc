@@ -7,7 +7,8 @@ import { db } from './database.js';
 
 export const REFRESH_COOKIE_NAME = 'refreshToken';
 export const ACCESS_TOKEN_EXPIRY = '15m';
-export const REFRESH_TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+export const REFRESH_TOKEN_TTL_PERSISTENT = 30 * 24 * 60 * 60; // 30 days
+export const REFRESH_TOKEN_TTL_SESSION = 24 * 60 * 60; // 1 day
 
 export interface SessionUser {
   id: string;
@@ -37,17 +38,19 @@ export function generateAccessToken(user: SessionUser): string {
  * Issue new session:
  * 1. Creates RS256 access token (15m)
  * 2. Generates secure random refresh token
- * 3. Hashes refresh token and stores in Redis with 7-day TTL
- * 4. Sets httpOnly, secure, SameSite cookie
+ * 3. Hashes refresh token and stores in Redis (30 days if keepMeSignedIn, else session TTL)
+ * 4. Sets httpOnly, secure, SameSite cookie (session cookie unless keepMeSignedIn is true)
  */
 export async function createSession(
   user: SessionUser,
   res?: Response,
-  metadata?: { ip?: string; userAgent?: string }
+  metadata?: { ip?: string; userAgent?: string; keepMeSignedIn?: boolean }
 ): Promise<{ accessToken: string; refreshToken: string }> {
   const accessToken = generateAccessToken(user);
   const rawRefreshToken = generateRandomToken(32);
   const tokenHash = hashToken(rawRefreshToken);
+  const keepMeSignedIn = Boolean(metadata?.keepMeSignedIn);
+  const ttlSeconds = keepMeSignedIn ? REFRESH_TOKEN_TTL_PERSISTENT : REFRESH_TOKEN_TTL_SESSION;
 
   const redis = getRedisClient();
   const sessionKey = `user_session:${user.id}:${tokenHash}`;
@@ -58,15 +61,16 @@ export async function createSession(
     createdAt: new Date().toISOString(),
     ip: metadata?.ip || 'unknown',
     userAgent: metadata?.userAgent || 'unknown',
+    keepMeSignedIn,
   });
 
-  await redis.set(sessionKey, sessionData, 'EX', REFRESH_TOKEN_TTL_SECONDS);
+  await redis.set(sessionKey, sessionData, 'EX', ttlSeconds);
   await redis.sadd(indexKey, tokenHash);
-  await redis.expire(indexKey, REFRESH_TOKEN_TTL_SECONDS);
+  await redis.expire(indexKey, ttlSeconds);
 
   // Set httpOnly, secure, SameSite cookie if Response is provided
   if (res) {
-    setRefreshTokenCookie(res, rawRefreshToken);
+    setRefreshTokenCookie(res, rawRefreshToken, keepMeSignedIn);
   }
 
   return { accessToken, refreshToken: rawRefreshToken };
@@ -74,15 +78,19 @@ export async function createSession(
 
 /**
  * Set httpOnly SameSite cookie for refresh token
+ * If keepMeSignedIn is false, maxAge is omitted making it a browser session cookie
  */
-export function setRefreshTokenCookie(res: Response, refreshToken: string) {
-  res.cookie(REFRESH_COOKIE_NAME, refreshToken, {
+export function setRefreshTokenCookie(res: Response, refreshToken: string, keepMeSignedIn: boolean = false) {
+  const cookieOptions: any = {
     httpOnly: true,
     secure: process.env.NODE_ENV === 'production',
     sameSite: 'lax',
-    maxAge: REFRESH_TOKEN_TTL_SECONDS * 1000,
     path: '/',
-  });
+  };
+  if (keepMeSignedIn) {
+    cookieOptions.maxAge = REFRESH_TOKEN_TTL_PERSISTENT * 1000;
+  }
+  res.cookie(REFRESH_COOKIE_NAME, refreshToken, cookieOptions);
 }
 
 /**
@@ -119,6 +127,17 @@ export async function rotateRefreshToken(
   const parts = sessionKey.split(':');
   const userId = parts[1];
 
+  let keepMeSignedIn = false;
+  try {
+    const rawData = await redis.get(sessionKey);
+    if (rawData) {
+      const parsed = JSON.parse(rawData);
+      keepMeSignedIn = Boolean(parsed.keepMeSignedIn);
+    }
+  } catch {
+    // ignore
+  }
+
   // Retrieve user from DB to verify still active and fetch latest role
   const user = await db('users').where({ id: userId }).first();
   if (!user || user.status !== 'active') {
@@ -140,7 +159,7 @@ export async function rotateRefreshToken(
       tokenVersion: user.token_version || 1,
     },
     res,
-    metadata
+    { ...metadata, keepMeSignedIn }
   );
 
   return {
@@ -152,11 +171,26 @@ export async function rotateRefreshToken(
 /**
  * Invalidate a specific refresh token (Logout)
  */
-export async function revokeSession(userId: string, rawRefreshToken: string) {
+export async function revokeSessionByToken(rawRefreshToken: string) {
   const tokenHash = hashToken(rawRefreshToken);
   const redis = getRedisClient();
-  await redis.del(`user_session:${userId}:${tokenHash}`);
-  await redis.srem(`user_session_hashes:${userId}`, tokenHash);
+  const keys = await redis.keys(`user_session:*:${tokenHash}`);
+  if (keys && keys.length > 0) {
+    for (const sessionKey of keys) {
+      const parts = sessionKey.split(':');
+      const userId = parts[1];
+      await redis.del(sessionKey);
+      await redis.srem(`user_session_hashes:${userId}`, tokenHash);
+    }
+  }
+}
+
+export async function revokeSession(userId: string, rawRefreshToken: string) {
+  if (rawRefreshToken) {
+    await revokeSessionByToken(rawRefreshToken);
+  } else if (userId) {
+    await revokeAllSessionsForUser(userId);
+  }
 }
 
 /**

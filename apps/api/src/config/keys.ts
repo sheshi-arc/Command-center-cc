@@ -11,6 +11,13 @@ export function getJwtKeys(): { privateKey: string; publicKey: string } {
     return { privateKey, publicKey };
   }
 
+  // 1. Read directly from environment variables if provided
+  if (process.env.JWT_PRIVATE_KEY && process.env.JWT_PUBLIC_KEY) {
+    privateKey = process.env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n');
+    publicKey = process.env.JWT_PUBLIC_KEY.replace(/\\n/g, '\n');
+    return { privateKey, publicKey };
+  }
+
   const keysDir = path.resolve(process.cwd(), 'keys');
   const privateKeyPath = path.resolve(process.cwd(), ENV.JWT_PRIVATE_KEY_PATH);
   const publicKeyPath = path.resolve(process.cwd(), ENV.JWT_PUBLIC_KEY_PATH);

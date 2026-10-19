@@ -45,6 +45,25 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ currentUser, onLogout }) =
   const isManagement =
     currentUser.role === USER_ROLES.ADMIN || currentUser.role === USER_ROLES.LEAD;
 
+  const [isResending, setIsResending] = useState(false);
+  const [resendSuccess, setResendSuccess] = useState(false);
+
+  const handleResendVerification = async () => {
+    setIsResending(true);
+    try {
+      await apiRequest('/auth/resend-verification', {
+        method: 'POST',
+        body: JSON.stringify({ email: currentUser.email }),
+      });
+      setResendSuccess(true);
+      setTimeout(() => setResendSuccess(false), 5000);
+    } catch {
+      // ignore
+    } finally {
+      setIsResending(false);
+    }
+  };
+
   // 1. Fetch live notifications
   const { data: notifData } = useQuery({
     queryKey: ['notifications'],
@@ -198,6 +217,29 @@ export const AppLayout: React.FC<AppLayoutProps> = ({ currentUser, onLogout }) =
             </div>
           </div>
         </header>
+
+        {/* Email verification reminder banner */}
+        {currentUser && currentUser.emailVerified === false && (
+          <div className="bg-amber-50 dark:bg-amber-950/50 border-b border-amber-200 dark:border-amber-900/60 px-4 py-2 flex items-center justify-between text-xs text-amber-800 dark:text-amber-200 shrink-0">
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+              <span>Verify your email to secure your account.</span>
+              {resendSuccess && (
+                <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
+                  (Verification email sent!)
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={handleResendVerification}
+              disabled={isResending}
+              className="font-bold underline hover:no-underline text-amber-900 dark:text-amber-100 min-h-[32px] px-2 flex items-center disabled:opacity-50"
+            >
+              {isResending ? 'Sending...' : 'Resend link'}
+            </button>
+          </div>
+        )}
 
         {/* Scrollable Viewport for Screen Content */}
         <main className="flex-1 overflow-y-auto overflow-x-hidden p-3.5 sm:p-6 lg:p-8 pb-20 lg:pb-8">

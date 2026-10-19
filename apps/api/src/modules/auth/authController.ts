@@ -14,6 +14,7 @@ import {
   createSession,
   rotateRefreshToken,
   revokeSession,
+  revokeSessionByToken,
   revokeAllSessionsForUser,
   clearRefreshTokenCookie,
   REFRESH_COOKIE_NAME,
@@ -21,24 +22,207 @@ import {
 import { sendSystemNotification } from '../automations/emailService.js';
 import { USER_ROLES, INTERN_TYPES } from '@command-center/shared';
 
-const UNIFORM_LOGIN_ERROR = 'Email or password is incorrect';
+const UNIFORM_LOGIN_ERROR = 'Email or password is incorrect.';
 
 /**
- * Public registration is disabled per specification.
- * Accounts can only be created via single-use invite link.
+ * Open Sign Up:
+ * Anyone can register with any email address (Gmail, college, company, anything).
+ * Plain labels. Validates 8+ chars with at least one letter and number.
+ * Account created as Unpaid intern with no team.
+ * Sends 24h single-use verification email.
+ * Immediately signs user in with access token and session cookie.
  */
-export async function register(_req: Request, res: Response) {
-  return res.status(403).json({
-    message: 'Public registration is disabled. You must be invited by an administrator or team lead.',
+export async function register(req: Request, res: Response) {
+  const { name, email, password } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'Full name, email, and password are required' });
+  }
+
+  const normalizedEmail = String(email).trim().toLowerCase();
+
+  // Password rules: at least 8 characters with at least one letter and one number
+  if (password.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long' });
+  }
+  if (!/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
+    return res.status(400).json({ message: 'Password must contain at least one letter and one number' });
+  }
+
+  // Duplicate email check
+  const existingUser = await db('users').whereRaw('LOWER(email) = ?', [normalizedEmail]).first();
+  if (existingUser) {
+    return res.status(409).json({
+      message: 'An account with this email already exists. Sign in instead.',
+    });
+  }
+
+  const passwordHash = await hashPassword(password);
+  const userId = `u-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  const rawVerifyToken = generateRandomToken(32);
+  const verifyTokenHash = hashToken(rawVerifyToken);
+  const verifyExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+  const icsToken = generateRandomToken(24);
+
+  // New account created as Unpaid intern with no team
+  await db('users').insert({
+    id: userId,
+    name: String(name).trim(),
+    email: normalizedEmail,
+    password_hash: passwordHash,
+    role: USER_ROLES.UNPAID_INTERN,
+    intern_type: INTERN_TYPES.UNPAID,
+    team_id: null,
+    paired_paid_intern_id: null,
+    current_level: 1,
+    status: 'active',
+    token_version: 1,
+    email_verified: false,
+    email_verification_token_hash: verifyTokenHash,
+    email_verification_expires_at: verifyExpiresAt,
+    ics_token: icsToken,
+    created_at: new Date(),
+    updated_at: new Date(),
+  });
+
+  // Send verification email with 24-hour single-use link
+  const verificationLink = `${ENV.CLIENT_ORIGIN || 'http://localhost:5173'}/verify-email?token=${rawVerifyToken}`;
+  try {
+    await sendSystemNotification({
+      eventType: 'EMAIL_VERIFICATION',
+      recipientEmail: normalizedEmail,
+      recipientName: String(name).trim(),
+      variables: {
+        verification_link: verificationLink,
+      },
+    });
+  } catch (err) {
+    console.warn('[Register] Error dispatching verification email:', err);
+  }
+
+  // Issue session so user is immediately logged in
+  const session = await createSession(
+    {
+      id: userId,
+      email: normalizedEmail,
+      role: USER_ROLES.UNPAID_INTERN,
+      tokenVersion: 1,
+    },
+    res,
+    { ip: getClientIp(req), userAgent: req.headers['user-agent'], keepMeSignedIn: false }
+  );
+
+  return res.status(201).json({
+    message: 'Account created successfully. A verification link has been sent to your email.',
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    user: {
+      id: userId,
+      name: String(name).trim(),
+      email: normalizedEmail,
+      role: USER_ROLES.UNPAID_INTERN,
+      internType: INTERN_TYPES.UNPAID,
+      currentLevel: 1,
+      emailVerified: false,
+      mustChangePassword: false,
+    },
+    redirectUrl: '/',
   });
 }
 
 /**
- * Standard Login (Email & Password)
- * Uniform error message, rate limited, 15-minute lock after 5 failed attempts, bcrypt cost 12
+ * Verify Email:
+ * Validates single-use 24-hour token. Marks email as verified.
+ */
+export async function verifyEmail(req: Request, res: Response) {
+  const token = (req.query?.token as string) || req.body?.token;
+
+  if (!token) {
+    return res.status(400).json({ message: 'This verification link is invalid or has already been used.' });
+  }
+
+  const tokenHash = hashToken(token);
+  const user = await db('users').where({ email_verification_token_hash: tokenHash }).first();
+
+  if (!user) {
+    return res.status(400).json({ message: 'This verification link is invalid or has already been used.' });
+  }
+
+  if (user.email_verification_expires_at && new Date(user.email_verification_expires_at) < new Date()) {
+    return res.status(400).json({ message: 'This verification link has expired. Please request a new one.' });
+  }
+
+  await db('users')
+    .where({ id: user.id })
+    .update({
+      email_verified: true,
+      email_verification_token_hash: null,
+      email_verification_expires_at: null,
+      updated_at: new Date(),
+    });
+
+  return res.json({ message: 'Email verified successfully!' });
+}
+
+/**
+ * Resend Email Verification:
+ * Generates fresh 24-hour token and sends verification link.
+ */
+export async function resendVerification(req: Request, res: Response) {
+  const emailFromBody = req.body?.email;
+  const emailFromUser = req.user?.email;
+  const targetEmail = (emailFromBody || emailFromUser || '').trim().toLowerCase();
+
+  if (!targetEmail) {
+    return res.status(400).json({ message: 'Email is required to resend verification' });
+  }
+
+  const user = await db('users').whereRaw('LOWER(email) = ?', [targetEmail]).first();
+  if (!user) {
+    return res.json({ message: 'If an account exists, a new verification link has been sent.' });
+  }
+
+  if (user.email_verified) {
+    return res.json({ message: 'Email is already verified.' });
+  }
+
+  const rawVerifyToken = generateRandomToken(32);
+  const verifyTokenHash = hashToken(rawVerifyToken);
+  const verifyExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+  await db('users')
+    .where({ id: user.id })
+    .update({
+      email_verification_token_hash: verifyTokenHash,
+      email_verification_expires_at: verifyExpiresAt,
+      updated_at: new Date(),
+    });
+
+  const verificationLink = `${ENV.CLIENT_ORIGIN || 'http://localhost:5173'}/verify-email?token=${rawVerifyToken}`;
+  try {
+    await sendSystemNotification({
+      eventType: 'EMAIL_VERIFICATION',
+      recipientEmail: user.email,
+      recipientName: user.name,
+      variables: {
+        verification_link: verificationLink,
+      },
+    });
+  } catch (err) {
+    console.warn('[ResendVerification] Error:', err);
+  }
+
+  return res.json({ message: 'Verification email sent. Please check your inbox.' });
+}
+
+/**
+ * Standard Login:
+ * Plain labels. Exact uniform error message on wrong email or password: "Email or password is incorrect."
+ * Locks for 15 minutes after 5 wrong attempts.
+ * Supports "Keep me signed in" (30-day token vs session cookie).
  */
 export async function login(req: Request, res: Response) {
-  const { email, password } = req.body;
+  const { email, password, keepMeSignedIn } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ message: UNIFORM_LOGIN_ERROR });
@@ -65,6 +249,19 @@ export async function login(req: Request, res: Response) {
   // Deactivated user check
   if (user.status !== 'active') {
     return res.status(401).json({ message: UNIFORM_LOGIN_ERROR });
+  }
+
+  // Check admin requirement: "Require verified email before using the app" (default off)
+  try {
+    const requireVerificationSetting = await db('app_settings').where({ key: 'require_email_verification' }).first();
+    if (requireVerificationSetting?.value === 'true' && !user.email_verified) {
+      return res.status(403).json({
+        message: 'Email verification is required before using the app. Please verify your email.',
+        requiresVerification: true,
+      });
+    }
+  } catch {
+    // If setting table missing in dev, skip
   }
 
   // Password verification
@@ -108,7 +305,7 @@ export async function login(req: Request, res: Response) {
       tokenVersion: user.token_version || 1,
     },
     res,
-    { ip: getClientIp(req), userAgent: req.headers['user-agent'] }
+    { ip: getClientIp(req), userAgent: req.headers['user-agent'], keepMeSignedIn: Boolean(keepMeSignedIn) }
   );
 
   return res.json({
@@ -126,6 +323,105 @@ export async function login(req: Request, res: Response) {
       marksheetConfirmed: user.marksheet_confirmed,
       avatarUrl: user.avatar_url,
       mustChangePassword: Boolean(user.must_change_password),
+      emailVerified: Boolean(user.email_verified),
+    },
+    redirectUrl: '/',
+  });
+}
+
+/**
+ * Google Sign-In:
+ * Signs in existing user or creates an Unpaid intern account with verified email.
+ */
+export async function googleSignIn(req: Request, res: Response) {
+  const { token, credential, keepMeSignedIn } = req.body;
+  const rawIdToken = token || credential;
+
+  if (!rawIdToken) {
+    return res.status(400).json({ message: 'Google ID token required' });
+  }
+
+  let email: string | null = null;
+  let name: string | null = null;
+
+  try {
+    const verifyRes = await fetch(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(rawIdToken)}`
+    );
+    if (!verifyRes.ok) {
+      return res.status(401).json({ message: 'Invalid Google credential token' });
+    }
+    const tokenInfo = (await verifyRes.json()) as any;
+    email = tokenInfo.email;
+    name = tokenInfo.name;
+  } catch {
+    return res.status(401).json({ message: 'Failed to verify Google token' });
+  }
+
+  if (!email) {
+    return res.status(401).json({ message: 'Google token does not contain email' });
+  }
+
+  const normalizedEmail = String(email).trim().toLowerCase();
+  let user = await db('users').whereRaw('LOWER(email) = ?', [normalizedEmail]).first();
+
+  if (!user) {
+    const userId = `u-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const icsToken = generateRandomToken(24);
+
+    await db('users').insert({
+      id: userId,
+      name: name || normalizedEmail.split('@')[0],
+      email: normalizedEmail,
+      password_hash: null,
+      role: USER_ROLES.UNPAID_INTERN,
+      intern_type: INTERN_TYPES.UNPAID,
+      team_id: null,
+      paired_paid_intern_id: null,
+      status: 'active',
+      current_level: 1,
+      token_version: 1,
+      email_verified: true,
+      must_change_password: false,
+      ics_token: icsToken,
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+
+    user = await db('users').where({ id: userId }).first();
+  }
+
+  if (user.status !== 'active') {
+    return res.status(401).json({ message: UNIFORM_LOGIN_ERROR });
+  }
+
+  const session = await createSession(
+    {
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      tokenVersion: user.token_version || 1,
+    },
+    res,
+    { ip: getClientIp(req), userAgent: req.headers['user-agent'], keepMeSignedIn: Boolean(keepMeSignedIn) }
+  );
+
+  return res.json({
+    accessToken: session.accessToken,
+    refreshToken: session.refreshToken,
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      internType: user.intern_type,
+      pairedPaidInternId: user.paired_paid_intern_id,
+      currentLevel: user.current_level,
+      marksheetPercentage: user.marksheet_percentage,
+      marksheetConfirmed: user.marksheet_confirmed,
+      avatarUrl: user.avatar_url,
+      mustChangePassword: Boolean(user.must_change_password),
+      emailVerified: Boolean(user.email_verified),
     },
     redirectUrl: '/',
   });
@@ -133,194 +429,63 @@ export async function login(req: Request, res: Response) {
 
 /**
  * Microsoft OpenID Connect SSO Sign-In:
- * OFF unless configured in environment variables. Only invited emails can sign in.
  */
 export async function microsoftSignIn(req: Request, res: Response) {
   if (!ENV.MS_OIDC_CLIENT_ID) {
     return res.status(403).json({ message: 'Microsoft Sign-In is not configured.' });
   }
+  return res.status(501).json({ message: 'Microsoft Sign-In pending institutional callback.' });
+}
 
-  const { email, microsoftId, name } = req.body;
-
-  if (!email) {
-    return res.status(400).json({ message: 'Email is required for Microsoft Sign-In' });
-  }
-
-  const normalizedEmail = String(email).trim().toLowerCase();
-
-  let user = await db('users').whereRaw('LOWER(email) = ?', [normalizedEmail]).first();
-  const invite = await db('invites')
-    .whereRaw('LOWER(email) = ?', [normalizedEmail])
-    .whereIn('status', ['pending', 'accepted'])
-    .first();
-
-  if (!user && !invite) {
-    return res.status(403).json({
-      message: 'You have not been invited. Ask your team lead.',
-    });
-  }
-
-  if (user && user.status === 'inactive') {
-    return res.status(403).json({
-      message: 'Your account has been deactivated. Ask your team lead.',
-    });
-  }
-
-  if (!user && invite) {
-    const userId = `u-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    await db('users').insert({
-      id: userId,
-      name: name || invite.name,
-      email: normalizedEmail,
-      microsoft_id: microsoftId || `ms-${Date.now()}`,
-      role: invite.role,
-      intern_type: invite.intern_type,
-      team_id: invite.team_id,
-      status: 'active',
-      current_level: 1,
-      token_version: 1,
-      must_change_password: false,
-      created_at: new Date(),
-      updated_at: new Date(),
-    });
-
-    await db('invites').where({ id: invite.id }).update({
-      status: 'accepted',
-      accepted_at: new Date(),
-      updated_at: new Date(),
-    });
-
-    user = await db('users').where({ id: userId }).first();
-  } else if (user) {
-    const updates: Record<string, any> = { updated_at: new Date() };
-    if (!user.microsoft_id && microsoftId) updates.microsoft_id = microsoftId;
-    if (user.status === 'pending_invite') updates.status = 'active';
-    await db('users').where({ id: user.id }).update(updates);
-
-    if (invite && invite.status === 'pending') {
-      await db('invites').where({ id: invite.id }).update({
-        status: 'accepted',
-        accepted_at: new Date(),
-        updated_at: new Date(),
-      });
-    }
-    user = await db('users').where({ id: user.id }).first();
-  }
-
-  const session = await createSession(
-    {
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      tokenVersion: user.token_version || 1,
-    },
-    res,
-    { ip: getClientIp(req), userAgent: req.headers['user-agent'] }
-  );
-
+/**
+ * Public Authentication Configuration:
+ * Exposes whether Google Sign-In is available without exposing secrets.
+ */
+export async function getAuthConfig(_req: Request, res: Response) {
   return res.json({
-    accessToken: session.accessToken,
-    refreshToken: session.refreshToken,
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      internType: user.intern_type,
-      currentLevel: user.current_level,
-      avatarUrl: user.avatar_url,
-      mustChangePassword: Boolean(user.must_change_password),
-    },
-    redirectUrl: '/',
+    googleClientId: ENV.GOOGLE_CLIENT_ID || null,
   });
 }
 
 /**
- * Google SSO Sign-In:
- * OFF unless GOOGLE_CLIENT_ID is set. Only invited emails can sign in.
+ * Get App Settings (Admin requirement for verified email)
  */
-export async function googleSignIn(req: Request, res: Response) {
-  if (!ENV.GOOGLE_CLIENT_ID) {
-    return res.status(403).json({ message: 'Google Sign-In is not configured.' });
-  }
-
-  const { email, name } = req.body;
-  if (!email) {
-    return res.status(400).json({ message: 'Email is required for Google Sign-In' });
-  }
-
-  const normalizedEmail = String(email).trim().toLowerCase();
-
-  let user = await db('users').whereRaw('LOWER(email) = ?', [normalizedEmail]).first();
-  const invite = await db('invites')
-    .whereRaw('LOWER(email) = ?', [normalizedEmail])
-    .whereIn('status', ['pending', 'accepted'])
-    .first();
-
-  if (!user && !invite) {
-    return res.status(403).json({
-      message: 'You have not been invited. Ask your team lead.',
+export async function getAppSettings(_req: Request, res: Response) {
+  try {
+    const setting = await db('app_settings').where({ key: 'require_email_verification' }).first();
+    return res.json({
+      requireEmailVerification: setting?.value === 'true',
     });
+  } catch {
+    return res.json({ requireEmailVerification: false });
+  }
+}
+
+/**
+ * Update App Settings (Admin setting: "Require verified email before using the app")
+ */
+export async function updateAppSettings(req: Request, res: Response) {
+  const { requireEmailVerification } = req.body;
+  if (typeof requireEmailVerification !== 'boolean') {
+    return res.status(400).json({ message: 'requireEmailVerification boolean required' });
   }
 
-  if (user && user.status === 'inactive') {
-    return res.status(403).json({
-      message: 'Your account has been deactivated. Ask your team lead.',
-    });
+  try {
+    const existing = await db('app_settings').where({ key: 'require_email_verification' }).first();
+    if (existing) {
+      await db('app_settings')
+        .where({ key: 'require_email_verification' })
+        .update({ value: String(requireEmailVerification), updated_at: new Date() });
+    } else {
+      await db('app_settings').insert({
+        key: 'require_email_verification',
+        value: String(requireEmailVerification),
+      });
+    }
+    return res.json({ requireEmailVerification, message: 'Settings updated successfully' });
+  } catch (err: any) {
+    return res.status(500).json({ message: err.message || 'Failed to update settings' });
   }
-
-  if (!user && invite) {
-    const userId = `u-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-    await db('users').insert({
-      id: userId,
-      name: name || invite.name,
-      email: normalizedEmail,
-      role: invite.role,
-      intern_type: invite.intern_type,
-      team_id: invite.team_id,
-      status: 'active',
-      current_level: 1,
-      token_version: 1,
-      must_change_password: false,
-      created_at: new Date(),
-      updated_at: new Date(),
-    });
-
-    await db('invites').where({ id: invite.id }).update({
-      status: 'accepted',
-      accepted_at: new Date(),
-      updated_at: new Date(),
-    });
-
-    user = await db('users').where({ id: userId }).first();
-  }
-
-  const session = await createSession(
-    {
-      id: user.id,
-      email: user.email,
-      role: user.role,
-      tokenVersion: user.token_version || 1,
-    },
-    res,
-    { ip: getClientIp(req), userAgent: req.headers['user-agent'] }
-  );
-
-  return res.json({
-    accessToken: session.accessToken,
-    refreshToken: session.refreshToken,
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      internType: user.intern_type,
-      currentLevel: user.current_level,
-      avatarUrl: user.avatar_url,
-      mustChangePassword: Boolean(user.must_change_password),
-    },
-    redirectUrl: '/',
-  });
 }
 
 /**
@@ -357,8 +522,10 @@ export async function refreshToken(req: Request, res: Response) {
 export async function logout(req: Request, res: Response) {
   const token = req.cookies?.[REFRESH_COOKIE_NAME] || req.body?.refreshToken;
 
-  if (req.user && token) {
-    await revokeSession(req.user.id, token);
+  if (token) {
+    await revokeSessionByToken(token);
+  } else if (req.user) {
+    await revokeAllSessionsForUser(req.user.id);
   }
 
   clearRefreshTokenCookie(res);
@@ -388,7 +555,7 @@ export async function signoutAllDevices(req: Request, res: Response) {
  */
 export async function forgotPassword(req: Request, res: Response) {
   const { email } = req.body;
-  const uniformConfirmation = 'If an account exists with this email, instructions have been dispatched.';
+  const uniformConfirmation = 'If an account exists with this email, a password reset link has been sent.';
 
   if (!email) {
     return res.json({ message: uniformConfirmation });
@@ -417,7 +584,7 @@ export async function forgotPassword(req: Request, res: Response) {
       updated_at: new Date(),
     });
 
-    const resetLink = `${ENV.CLIENT_ORIGIN}/reset-password?token=${rawResetToken}`;
+    const resetLink = `${ENV.CLIENT_ORIGIN || 'http://localhost:5173'}/reset-password?token=${rawResetToken}`;
 
     // Background email dispatch
     setImmediate(async () => {
@@ -450,8 +617,8 @@ export async function resetPassword(req: Request, res: Response) {
     return res.status(400).json({ message: 'Token and new password are required' });
   }
 
-  if (password.length < 10) {
-    return res.status(400).json({ message: 'Password must be at least 10 characters long' });
+  if (password.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long' });
   }
   if (!/[a-zA-Z]/.test(password) || !/\d/.test(password)) {
     return res.status(400).json({ message: 'Password must contain at least one letter and one number' });
@@ -512,8 +679,8 @@ export async function changePassword(req: Request, res: Response) {
     return res.status(400).json({ message: 'New password is required' });
   }
 
-  if (newPassword.length < 10) {
-    return res.status(400).json({ message: 'Password must be at least 10 characters long' });
+  if (newPassword.length < 8) {
+    return res.status(400).json({ message: 'Password must be at least 8 characters long' });
   }
   if (!/[a-zA-Z]/.test(newPassword) || !/\d/.test(newPassword)) {
     return res.status(400).json({ message: 'Password must contain at least one letter and one number' });
@@ -524,28 +691,33 @@ export async function changePassword(req: Request, res: Response) {
     return res.status(404).json({ message: 'User not found' });
   }
 
-  // If current password provided and user has password hash, check it
-  if (currentPassword && user.password_hash) {
-    const valid = await comparePassword(currentPassword, user.password_hash);
-    if (!valid) {
+  // If user already has a password and is not forced to change, verify current password
+  if (user.password_hash && !user.must_change_password) {
+    if (!currentPassword) {
+      return res.status(400).json({ message: 'Current password is required' });
+    }
+    const currentValid = await comparePassword(currentPassword, user.password_hash);
+    if (!currentValid) {
       return res.status(400).json({ message: 'Current password is incorrect' });
     }
   }
 
   const newHash = await hashPassword(newPassword);
+
   await db('users')
     .where({ id: user.id })
     .update({
       password_hash: newHash,
       must_change_password: false,
+      token_version: (user.token_version || 1) + 1,
       updated_at: new Date(),
     });
 
-  return res.json({ message: 'Password changed successfully' });
+  return res.json({ message: 'Password updated successfully' });
 }
 
 /**
- * Get Current User / Profile
+ * Get Profile & Current User Details
  */
 export async function getCurrentUser(req: Request, res: Response) {
   if (!req.user) {
@@ -586,6 +758,7 @@ export async function getCurrentUser(req: Request, res: Response) {
     emailNotificationsMuted: Boolean(user.email_notifications_muted),
     pushNotificationsMuted: Boolean(user.push_notifications_muted),
     mustChangePassword: Boolean(user.must_change_password),
+    emailVerified: Boolean(user.email_verified),
     hasGoogleCalendar: Boolean(user.google_refresh_token_encrypted),
     icsToken: user.ics_token,
     createdAt: user.created_at,
@@ -630,6 +803,7 @@ export async function updateProfile(req: Request, res: Response) {
       avatarUrl: updatedUser.avatar_url,
       emailNotificationsMuted: Boolean(updatedUser.email_notifications_muted),
       pushNotificationsMuted: Boolean(updatedUser.push_notifications_muted),
+      emailVerified: Boolean(updatedUser.email_verified),
     },
   });
 }
