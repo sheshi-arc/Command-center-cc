@@ -1,0 +1,1 @@
+import{j as a}from"./index-BEHHY1q4.js";const e=({children:s,className:o="",padding:r="md",...d})=>{const t={none:"",sm:"p-3.5",md:"p-5",lg:"p-6"};return a.jsx("div",{className:`bg-white border border-slate-200/90 rounded-xl shadow-xs transition-shadow duration-200 ${t[r]} ${o}`,...d,children:s})};export{e as C};
